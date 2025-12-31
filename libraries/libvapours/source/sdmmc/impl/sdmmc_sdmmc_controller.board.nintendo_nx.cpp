@@ -105,6 +105,7 @@ namespace ams::sdmmc::impl {
     namespace {
 
         constexpr inline u32 TuningCommandTimeoutMilliSeconds = 5;
+        constexpr inline u32 SAMPLING_WINDOW_SIZE_MIN = 8;//ideal is 2.5 rounded to 3 but Hekate uses 8
 
         constexpr void GetDividerSetting(u32 *out_target_clock_frequency_khz, u16 *out_x, SpeedMode speed_mode) {
             switch (speed_mode) {
@@ -160,6 +161,12 @@ namespace ams::sdmmc::impl {
                     *out_target_clock_frequency_khz = 200000;
                     *out_x                          = 2;
                     break;
+                #ifdef SDMMC_UHS_DDR200_SUPPORT//DDR200 implementation case
+                    case SpeedMode_SdCardDdr200:
+                        *out_target_clock_frequency_khz = 400000;
+                        *out_x                          = 2;
+                        break;
+                #endif
                 case SpeedMode_SdCardSdr25:
                 case SpeedMode_SdCardDdr50:
                 AMS_UNREACHABLE_DEFAULT_CASE();
@@ -392,6 +399,13 @@ namespace ams::sdmmc::impl {
                 reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.host_control2, SD_REG_BITS_ENUM(HOST_CONTROL2_UHS_MODE_SELECT, SDR104));
                 reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.host_control2, SD_REG_BITS_ENUM(HOST_CONTROL2_1_8V_SIGNALING_ENABLE, 1_8V_SIGNALING));
                 break;
+            #ifdef SDMMC_UHS_DDR200_SUPPORT//DDR200 implementation case
+                case SpeedMode_SdCardDdr200:
+                    /* Set as DDR200, 1.8V. */
+                    reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.host_control2, SD_REG_BITS_ENUM(HOST_CONTROL2_UHS_MODE_SELECT, DDR200));
+                    reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.host_control2, SD_REG_BITS_ENUM(HOST_CONTROL2_1_8V_SIGNALING_ENABLE, 1_8V_SIGNALING));
+                    break;
+            #endif
             case SpeedMode_GcAsicFpgaSpeed:
             case SpeedMode_GcAsicSpeed:
                 /* Set as HS200, 1.8V. */
@@ -429,7 +443,43 @@ namespace ams::sdmmc::impl {
             /* Turn on the clock. */
             reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.clock_control, SD_REG_BITS_ENUM(CLOCK_CONTROL_SD_CLOCK_ENABLE, ENABLE));
         }
+        #ifdef SDMMC_UHS_DDR200_SUPPORT
 
+        /* If speed mode is DDR200, perform 1.8V switch and drive-strength calibration similar to SwitchToSdr12. */
+        if (speed_mode == SpeedMode_SdCardDdr200) {
+
+            /* Disable clock and verify DAT lines are low before voltage switch (safety check). */
+            reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.clock_control, SD_REG_BITS_ENUM(CLOCK_CONTROL_SD_CLOCK_ENABLE, DISABLE));
+            R_UNLESS(reg::HasValue(m_sdmmc_registers->sd_host_standard_registers.present_state, SD_REG_BITS_VALUE(PRESENT_STATE_DAT0_3_LINE_SIGNAL_LEVEL, 0b0000)), sdmmc::ResultSdCardNotReadyToVoltageSwitch());
+
+            /* Ensure control and switch physical voltage to 1.8V. */
+            SdHostStandardController::EnsureControl();
+            R_TRY(this->LowerBusPower());
+            this->SetSchmittTrigger(BusPower_1_8V);
+
+            /* Perform drive strength calibration at 1.8V. */
+            this->SetDriveCodeOffsets(BusPower_1_8V);
+            this->CalibrateDriveStrength(BusPower_1_8V);
+
+            /* Set the bus power in standard controller. */
+            SdHostStandardController::SetBusPower(BusPower_1_8V);
+
+            /* Wait up to 5ms for the switch to take. */
+            SdHostStandardController::EnsureControl();
+            WaitMicroSeconds(5000);
+
+            /* Check that we switched to 1.8V. */
+            R_UNLESS(reg::HasValue(m_sdmmc_registers->sd_host_standard_registers.host_control2, SD_REG_BITS_ENUM(HOST_CONTROL2_1_8V_SIGNALING_ENABLE, 1_8V_SIGNALING)), sdmmc::ResultSdHostStandardFailSwitchTo1_8V());
+
+            /* Enable clock, and wait 1ms. */
+            reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.clock_control, SD_REG_BITS_ENUM(CLOCK_CONTROL_SD_CLOCK_ENABLE, ENABLE));
+            SdHostStandardController::EnsureControl();
+            WaitMicroSeconds(1000);
+
+            /* Check that the dat lines are all high. */
+            R_UNLESS(reg::HasValue(m_sdmmc_registers->sd_host_standard_registers.present_state, SD_REG_BITS_VALUE(PRESENT_STATE_DAT0_3_LINE_SIGNAL_LEVEL, 0b1111)), sdmmc::ResultSdCardNotCompleteVoltageSwitch());
+        }
+        #endif
         /* If speed mode is Hs400, calibrate dll. */
         if (speed_mode == SpeedMode_MmcHs400) {
             R_TRY(this->CalibrateDll());
@@ -820,6 +870,99 @@ namespace ams::sdmmc::impl {
         R_RETURN(SdHostStandardController::IssueStopTransmissionCommand(out_response));
     }
 
+        #ifdef SDMMC_UHS_DDR200_SUPPORT
+    Result SdmmcController::Tuning_Ddr200(u32 command_index, int max_retries) {
+        const int num_taps = 128;
+        std::array<bool, 128> good_taps = {};
+        Result best_result = sdmmc::ResultTuningFailed();
+        u32 best_tap = 0;
+        u32 best_window_size = 0;
+
+        /* Try tuning multiple times if requested */
+        for (int retry = 0; retry < max_retries; ++retry) {
+            /* Reset good_taps for this attempt */
+            good_taps.fill(false);
+
+            for (int tap = 0; tap < num_taps; ++tap) {
+                R_TRY(this->CheckRemoved());
+
+                /* Disable clock to set tap. */
+                reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.clock_control, SD_REG_BITS_ENUM(CLOCK_CONTROL_SD_CLOCK_ENABLE, DISABLE));
+
+                /* Set tap value updated by software. */
+                reg::ReadWrite(m_sdmmc_registers->vendor_tuning_cntrl0, SD_REG_BITS_ENUM(VENDOR_TUNING_CNTRL0_TAP_VALUE_UPDATED_BY_HW, NOT_UPDATED_BY_HW));
+
+                /* Set the inbound tap value. */
+                reg::ReadWrite(m_sdmmc_registers->vendor_clock_cntrl, SD_REG_BITS_VALUE(VENDOR_CLOCK_CNTRL_TAP_VAL, tap));
+
+            /* Enable clock. */
+            reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.clock_control, SD_REG_BITS_ENUM(CLOCK_CONTROL_SD_CLOCK_ENABLE, ENABLE));
+
+                /* Issue the tuning command. */
+                Result res = this->IssueTuningCommand(command_index);
+                if (R_SUCCEEDED(res)) {
+                    good_taps[tap] = true;
+                }
+            }
+
+            /* Find the largest consecutive window of good taps. */
+            u32 current_start = 0;
+            u32 current_size = 0;
+            u32 local_best_start = 0;
+            u32 local_best_size = 0;
+
+            for (int i = 0; i < num_taps; ++i) {
+                if (good_taps[i]) {
+                    if (current_size == 0) {
+                        current_start = i;
+                    }
+                    current_size++;
+                } else {
+                    if (current_size > local_best_size) {
+                        local_best_start = current_start;
+                        local_best_size = current_size;
+                    }
+                    current_size = 0;
+                }
+            }
+            if (current_size > local_best_size) {
+                local_best_start = current_start;
+                local_best_size = current_size;
+            }
+
+            /* If this attempt found a better window, save it */
+            if (local_best_size >= SAMPLING_WINDOW_SIZE_MIN && local_best_size > best_window_size) {
+                best_window_size = local_best_size;
+                best_tap = local_best_start + local_best_size / 2;
+                best_result = ResultSuccess();
+
+                /* If we found a good window, we can stop retrying */
+                if (local_best_size >= 16) {  // Prefer larger windows
+                    break;
+                }
+            }
+        }
+
+        /* Fail if no good taps found after all retries. */
+        R_UNLESS(best_window_size >= SAMPLING_WINDOW_SIZE_MIN, sdmmc::ResultTuningFailed());
+
+        /* Set the tap to the middle of the best window. */
+        /* Disable clock to set final tap. */
+        reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.clock_control, SD_REG_BITS_ENUM(CLOCK_CONTROL_SD_CLOCK_ENABLE, DISABLE));
+
+        /* Set tap value updated by software. */
+        reg::ReadWrite(m_sdmmc_registers->vendor_tuning_cntrl0, SD_REG_BITS_ENUM(VENDOR_TUNING_CNTRL0_TAP_VALUE_UPDATED_BY_HW, NOT_UPDATED_BY_HW));
+
+        /* Set the inbound tap value. */
+        reg::ReadWrite(m_sdmmc_registers->vendor_clock_cntrl, SD_REG_BITS_VALUE(VENDOR_CLOCK_CNTRL_TAP_VAL, best_tap));
+
+        /* Enable clock. */
+        reg::ReadWrite(m_sdmmc_registers->sd_host_standard_registers.clock_control, SD_REG_BITS_ENUM(CLOCK_CONTROL_SD_CLOCK_ENABLE, ENABLE));
+
+        R_SUCCEED();
+    }
+    #endif
+
     Result SdmmcController::Tuning(SpeedMode speed_mode, u32 command_index) {
         /* Clear vendor tuning control 1. */
         reg::Write(m_sdmmc_registers->vendor_tuning_cntrl1, 0);
@@ -839,6 +982,12 @@ namespace ams::sdmmc::impl {
                 num_tries      = 256;
                 reg::ReadWrite(m_sdmmc_registers->vendor_tuning_cntrl0, SD_REG_BITS_ENUM(VENDOR_TUNING_CNTRL0_NUM_TUNING_ITERATIONS, TRIES_256));
                 break;
+                #ifdef SDMMC_UHS_DDR200_SUPPORT
+            case SpeedMode_SdCardDdr200:
+                
+                return this->Tuning_Ddr200(command_index, 3);//passes CMD19 with target_sm of DDR200, allow 3 retries
+                break;
+                #endif
             AMS_UNREACHABLE_DEFAULT_CASE();
         }
 

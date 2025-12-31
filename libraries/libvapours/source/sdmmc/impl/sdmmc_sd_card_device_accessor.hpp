@@ -102,6 +102,7 @@ namespace ams::sdmmc::impl {
         SwitchFunctionAccessMode_Sdr50      = 2,
         SwitchFunctionAccessMode_Sdr104     = 3,
         SwitchFunctionAccessMode_Ddr50      = 4,
+        SwitchFunctionAccessMode_Ddr200     = 14,
     };
 
     class SdCardDeviceAccessor : public BaseDeviceAccessor {
@@ -168,7 +169,11 @@ namespace ams::sdmmc::impl {
                 m_work_buffer      = nullptr;
                 m_work_buffer_size = 0;
                 m_max_bus_width    = BusWidth_4Bit;
+                #ifdef SDMMC_UHS_DDR200_SUPPORT
+                m_max_speed_mode   = SpeedMode_SdCardDdr200;
+                #else
                 m_max_speed_mode   = SpeedMode_SdCardSdr104;
+                #endif
                 m_is_initialized   = false;
             }
 
@@ -181,7 +186,7 @@ namespace ams::sdmmc::impl {
             void AwakenSdCard();
             Result GetSdCardProtectedAreaCapacity(u32 *out_num_sectors) const;
             Result GetSdCardScr(void *dst, size_t dst_size) const;
-            Result GetSdCardSwitchFunctionStatus(void *dst, size_t dst_size, SdCardSwitchFunction switch_function) const;
+            Result GetSdCardSwitchFunctionStatus(void *dst, size_t dst_size, SdCardSwitchFunction switch_function);
             Result GetSdCardCurrentConsumption(u16 *out_current_consumption, SpeedMode speed_mode) const;
             Result GetSdCardSdStatus(void *dst, size_t dst_size) const;
 
@@ -217,6 +222,7 @@ namespace ams::sdmmc::impl {
                     AMS_ABORT("UnregisterSdCardDetectionEventCallback without SdCardDetector");
                 #endif
             }
+            
     };
 
 }
